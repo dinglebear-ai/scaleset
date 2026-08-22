@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -102,5 +103,79 @@ func TestGetAcquirableJobsHonorsCanceledAndDeadlineContexts(t *testing.T) {
 	defer stop()
 	if _, err := client.GetAcquirableJobs(deadline, 1); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline context was lost: %v", err)
+	}
+}
+
+func TestGetAcquirableJobsDoesNotBlockConcurrentArrivals(t *testing.T) {
+	firstArrived := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			close(firstArrived)
+			select {
+			case <-releaseFirst:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`{"count":0,"value":[]}`))
+	}))
+	defer server.Close()
+	client := acquirableTestClient(server)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.GetAcquirableJobs(context.Background(), 1)
+		firstDone <- err
+	}()
+	<-firstArrived
+
+	short, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := client.GetAcquirableJobs(short, 1)
+		secondDone <- err
+	}()
+	var secondErr error
+	select {
+	case secondErr = <-secondDone:
+	case <-short.Done():
+		secondErr = short.Err()
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	if errors.Is(secondErr, context.DeadlineExceeded) {
+		t.Fatalf("concurrent arrival was blocked behind the first response: %v", secondErr)
+	}
+	if secondErr != nil {
+		t.Fatalf("concurrent request failed: %v", secondErr)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("request count = %d, want 2", got)
+	}
+}
+
+func TestGetAcquirableJobsRejectsInvalidCounts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "negative", body: `{"count":-1,"value":[]}`},
+		{name: "mismatch", body: `{"count":2,"value":[{"runnerRequestId":101}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			if _, err := acquirableTestClient(server).GetAcquirableJobs(context.Background(), 1); err == nil ||
+				!strings.Contains(err.Error(), "invalid acquirable jobs count") {
+				t.Fatalf("invalid count was accepted: %v", err)
+			}
+		})
 	}
 }
