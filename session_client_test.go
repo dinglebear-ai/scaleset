@@ -26,6 +26,46 @@ func newTestSessionRequestHandler(t *testing.T, session RunnerScaleSetSession) h
 	}
 }
 
+func TestDeleteMessageSession(t *testing.T) {
+	ctx := context.Background()
+	auth := actionsAuth{token: "token"}
+	sessionID := uuid.MustParse("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+
+	t.Run("uses admin authentication and exact session identity", func(t *testing.T) {
+		var server *actionsServer
+		server = newActionsServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodDelete, r.Method)
+			assert.Equal(t,
+				"/tenant/123/_apis/runtime/runnerscalesets/7/sessions/"+sessionID.String(),
+				r.URL.Path)
+			assert.Equal(t, "6.0-preview", r.URL.Query().Get("api-version"))
+			assert.Equal(t, "Bearer "+server.token, r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		client, err := newClient(testSystemInfo, server.configURLForOrg("my-org"), auth)
+		require.NoError(t, err)
+		require.NoError(t, client.DeleteMessageSession(ctx, 7, sessionID))
+	})
+
+	t.Run("rejects invalid identities before issuing a request", func(t *testing.T) {
+		client, err := newClient(testSystemInfo, "https://github.com/my-org", auth)
+		require.NoError(t, err)
+		require.Error(t, client.DeleteMessageSession(ctx, 0, sessionID))
+		require.Error(t, client.DeleteMessageSession(ctx, 7, uuid.Nil))
+	})
+
+	t.Run("returns non-success response", func(t *testing.T) {
+		server := newActionsServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		client, err := newClient(testSystemInfo, server.configURLForOrg("my-org"), auth)
+		require.NoError(t, err)
+		err = client.DeleteMessageSession(ctx, 7, sessionID)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unexpected status code: 404")
+	})
+}
+
 func TestCreateMessageSession(t *testing.T) {
 	ctx := context.Background()
 	auth := actionsAuth{

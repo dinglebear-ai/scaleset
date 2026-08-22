@@ -72,8 +72,37 @@ func (c *MessageSessionClient) createMessageSession(ctx context.Context) error {
 
 // DeleteMessageSession deletes a message session for the specified runner scale set.
 func (c *MessageSessionClient) deleteMessageSession(ctx context.Context, runnerScaleSetID int, sessionID uuid.UUID) error {
+	return c.innerClient.DeleteMessageSession(ctx, runnerScaleSetID, sessionID)
+}
+
+// DeleteMessageSession deletes a message session by runner scale set ID and session ID.
+// It uses Actions service admin authentication, so callers can retire a stale
+// session after the MessageSessionClient that created it is no longer available.
+func (c *Client) DeleteMessageSession(ctx context.Context, runnerScaleSetID int, sessionID uuid.UUID) error {
+	if runnerScaleSetID <= 0 {
+		return fmt.Errorf("runner scale set ID must be positive")
+	}
+	if sessionID == uuid.Nil {
+		return fmt.Errorf("message session ID must not be nil")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	path := fmt.Sprintf("/%s/%d/sessions/%s", scaleSetEndpoint, runnerScaleSetID, sessionID.String())
-	return c.doSessionRequest(ctx, http.MethodDelete, path, nil, http.StatusNoContent, nil)
+	req, err := c.newActionsServiceRequest(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create new actions service request: %w", err)
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return fmt.Errorf("failed to issue the request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return newRequestResponseError(req, resp, fmt.Errorf("unexpected status code: %d", resp.StatusCode))
+	}
+	return nil
 }
 
 // RefreshMessageSession refreshes a message session for the specified runner scale set.
