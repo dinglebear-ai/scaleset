@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/actions/scaleset/internal/testserver"
 )
 
 func acquirableTestClient(server *httptest.Server) *Client {
@@ -177,5 +179,58 @@ func TestGetAcquirableJobsRejectsInvalidCounts(t *testing.T) {
 				t.Fatalf("invalid count was accepted: %v", err)
 			}
 		})
+	}
+}
+
+func TestGetAcquirableJobsDeadlineWhileTokenRefreshIsBlocked(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	server := testserver.New(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"count":0,"value":[]}`))
+	}), testserver.WithRunnerRegistrationTokenHandler(func(w http.ResponseWriter, r *http.Request) {
+		close(refreshStarted)
+		select {
+		case <-releaseRefresh:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"token":"registration-token"}`))
+	}))
+	client, err := newClient(testSystemInfo, server.ConfigURLForOrg("my-org"), actionsAuth{token: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.GetAcquirableJobs(context.Background(), 1)
+		firstDone <- err
+	}()
+	<-refreshStarted
+
+	deadline, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := client.GetAcquirableJobs(deadline, 1)
+		secondDone <- err
+	}()
+	var secondErr error
+	select {
+	case secondErr = <-secondDone:
+	case <-deadline.Done():
+		select {
+		case secondErr = <-secondDone:
+		case <-time.After(50 * time.Millisecond):
+			secondErr = errors.New("GetAcquirableJobs did not return when its context expired")
+		}
+	}
+	close(releaseRefresh)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("refreshing request failed: %v", err)
+	}
+	if !errors.Is(secondErr, context.DeadlineExceeded) {
+		t.Fatalf("short-deadline waiter returned %v, want context deadline exceeded", secondErr)
 	}
 }
